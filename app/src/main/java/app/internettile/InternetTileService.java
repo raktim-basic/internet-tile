@@ -83,17 +83,13 @@ public class InternetTileService extends TileService {
 
     @Override public void onClick() {
         Intent panel = new Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY);
+        panel.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                PendingIntent pendingIntent = PendingIntent.getActivity(
-                        this, 0, panel,
-                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-                startActivityAndCollapse(pendingIntent);
-            } else {
-                startActivityAndCollapse(panel);
-            }
+            // Launch directly rather than through TileService.startActivityAndCollapse().
+            // This avoids explicitly asking SystemUI to collapse Quick Settings.
+            startActivity(panel);
         } catch (RuntimeException e) {
-            Log.e(TAG, "Could not open the native Internet panel", e);
+            Log.e(TAG, "Could not open the native Internet panel without collapsing QS", e);
         }
     }
 
