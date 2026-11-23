@@ -5,8 +5,6 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.pm.PackageManager;
-import android.content.res.Resources;
 import android.graphics.drawable.Icon;
 import android.net.ConnectivityManager;
 import android.net.Network;
@@ -22,10 +20,8 @@ import android.telephony.TelephonyManager;
 import android.util.Log;
 
 public class InternetTileService extends TileService {
-
     private static final String TAG = "InternetTile";
-    private static final String SYSTEM_UI_PACKAGE = "com.android.systemui";
-    private static final int SIGNAL_LEVEL_COUNT = 5;
+    private static final int LEVEL_COUNT = 5;
 
     private ConnectivityManager connectivityManager;
     private WifiManager wifiManager;
@@ -34,54 +30,46 @@ public class InternetTileService extends TileService {
     private boolean receiverRegistered;
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
+        @Override public void onReceive(Context context, Intent intent) {
             updateTile();
         }
     };
 
-    @Override
-    public void onCreate() {
+    @Override public void onCreate() {
         super.onCreate();
         connectivityManager = getSystemService(ConnectivityManager.class);
         wifiManager = getApplicationContext().getSystemService(WifiManager.class);
         telephonyManager = getSystemService(TelephonyManager.class);
     }
 
-    @Override
-    public void onStartListening() {
+    @Override public void onStartListening() {
         super.onStartListening();
-        registerStateListeners();
+        registerListeners();
         updateTile();
     }
 
-    @Override
-    public void onStopListening() {
-        unregisterStateListeners();
+    @Override public void onStopListening() {
+        unregisterListeners();
         super.onStopListening();
     }
 
-    @Override
-    public void onClick() {
-        // Launch Android's own Internet panel. This app does not implement a panel.
-        Intent intent = new Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY);
+    @Override public void onClick() {
+        Intent panel = new Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY);
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 PendingIntent pendingIntent = PendingIntent.getActivity(
-                        this,
-                        0,
-                        intent,
+                        this, 0, panel,
                         PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
                 startActivityAndCollapse(pendingIntent);
             } else {
-                startActivityAndCollapse(intent);
+                startActivityAndCollapse(panel);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Unable to open the system Internet panel", e);
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Could not open the native Internet panel", e);
         }
     }
 
-    private void registerStateListeners() {
+    private void registerListeners() {
         if (!receiverRegistered) {
             IntentFilter filter = new IntentFilter();
             filter.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
@@ -98,47 +86,29 @@ public class InternetTileService extends TileService {
 
         if (connectivityManager != null && networkCallback == null) {
             networkCallback = new ConnectivityManager.NetworkCallback() {
-                @Override
-                public void onAvailable(Network network) {
-                    updateTile();
-                }
-
-                @Override
-                public void onLost(Network network) {
-                    updateTile();
-                }
-
-                @Override
-                public void onCapabilitiesChanged(
-                        Network network, NetworkCapabilities capabilities) {
-                    updateTile();
-                }
+                @Override public void onAvailable(Network network) { updateTile(); }
+                @Override public void onLost(Network network) { updateTile(); }
+                @Override public void onCapabilitiesChanged(
+                        Network network, NetworkCapabilities capabilities) { updateTile(); }
             };
             try {
                 connectivityManager.registerDefaultNetworkCallback(networkCallback);
             } catch (RuntimeException e) {
-                Log.w(TAG, "Could not register default-network callback", e);
+                Log.w(TAG, "Default network callback unavailable", e);
                 networkCallback = null;
             }
         }
     }
 
-    private void unregisterStateListeners() {
+    private void unregisterListeners() {
         if (receiverRegistered) {
-            try {
-                unregisterReceiver(stateReceiver);
-            } catch (IllegalArgumentException ignored) {
-                // The receiver was already unregistered by the framework.
-            }
+            try { unregisterReceiver(stateReceiver); }
+            catch (IllegalArgumentException ignored) { }
             receiverRegistered = false;
         }
-
         if (connectivityManager != null && networkCallback != null) {
-            try {
-                connectivityManager.unregisterNetworkCallback(networkCallback);
-            } catch (RuntimeException ignored) {
-                // The callback may already have been removed by the framework.
-            }
+            try { connectivityManager.unregisterNetworkCallback(networkCallback); }
+            catch (RuntimeException ignored) { }
             networkCallback = null;
         }
     }
@@ -147,176 +117,152 @@ public class InternetTileService extends TileService {
         Tile tile = getQsTile();
         if (tile == null) return;
 
-        boolean wifiEnabled = isWifiEnabled();
-        boolean mobileDataEnabled = isMobileDataEnabled();
-        boolean anyRadioEnabled = wifiEnabled || mobileDataEnabled;
-
-        ActiveTransport transport = getActiveTransport();
+        boolean anyRadioEnabled = isWifiEnabled() || isMobileDataEnabled();
+        Transport transport = getActiveTransport();
         tile.setLabel(getString(R.string.tile_label));
-        tile.setSubtitle(getConnectionSubtitle(transport));
-        tile.setIcon(getSystemSignalIcon(transport));
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            tile.setSubtitle(getSubtitle(transport));
+        }
+        tile.setIcon(getLocalSignalIcon(transport));
         tile.setState(anyRadioEnabled ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
         tile.updateTile();
     }
 
     private boolean isWifiEnabled() {
         if (wifiManager == null) return false;
-        try {
-            return wifiManager.isWifiEnabled();
-        } catch (RuntimeException e) {
-            Log.w(TAG, "Unable to read Wi-Fi enabled state", e);
+        try { return wifiManager.isWifiEnabled(); }
+        catch (RuntimeException e) {
+            Log.w(TAG, "Unable to read Wi-Fi state", e);
             return false;
         }
     }
 
     private boolean isMobileDataEnabled() {
-        if (telephonyManager == null) return false;
+        if (telephonyManager != null) {
+            try { return telephonyManager.isDataEnabled(); }
+            catch (RuntimeException e) {
+                Log.d(TAG, "Telephony data-state API unavailable; trying Settings fallback", e);
+            }
+        }
+        // Read-only fallback used by Android builds which restrict isDataEnabled() to
+        // phone-state/carrier privileges. OEMs may expose per-SIM variants instead.
         try {
-            return telephonyManager.isDataEnabled();
+            return Settings.Global.getInt(getContentResolver(), "mobile_data", 0) == 1;
         } catch (RuntimeException e) {
-            Log.w(TAG, "Unable to read mobile-data enabled state", e);
+            Log.w(TAG, "Unable to read mobile-data state", e);
             return false;
         }
     }
 
-    private ActiveTransport getActiveTransport() {
-        if (connectivityManager == null) return ActiveTransport.NONE;
-
-        Network network = connectivityManager.getActiveNetwork();
-        NetworkCapabilities capabilities = network == null
-                ? null : connectivityManager.getNetworkCapabilities(network);
-        if (capabilities == null) return ActiveTransport.NONE;
-
-        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-            return ActiveTransport.WIFI;
-        }
-        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
-            return ActiveTransport.CELLULAR;
-        }
-        return ActiveTransport.NONE;
+    private Transport getActiveTransport() {
+        if (connectivityManager == null) return Transport.NONE;
+        Network active = connectivityManager.getActiveNetwork();
+        NetworkCapabilities caps = active == null
+                ? null : connectivityManager.getNetworkCapabilities(active);
+        if (caps == null) return Transport.NONE;
+        // The active default network determines the icon. Do not infer the icon from
+        // radio-enabled state: both radios can be enabled while only one is in use.
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return Transport.WIFI;
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return Transport.CELLULAR;
+        return Transport.NONE;
     }
 
-    private int getWifiSignalLevel() {
+    private int getWifiLevel() {
         WifiInfo info = null;
-
-        if (connectivityManager != null) {
-            Network network = connectivityManager.getActiveNetwork();
-            NetworkCapabilities capabilities = network == null
-                    ? null : connectivityManager.getNetworkCapabilities(network);
-            if (capabilities != null
-                    && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-                    && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                Object transportInfo = capabilities.getTransportInfo();
-                if (transportInfo instanceof WifiInfo) {
-                    info = (WifiInfo) transportInfo;
-                }
+        if (connectivityManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Network active = connectivityManager.getActiveNetwork();
+            NetworkCapabilities caps = active == null
+                    ? null : connectivityManager.getNetworkCapabilities(active);
+            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                Object transportInfo = caps.getTransportInfo();
+                if (transportInfo instanceof WifiInfo) info = (WifiInfo) transportInfo;
             }
         }
-
         if (info == null && wifiManager != null) {
-            try {
-                info = wifiManager.getConnectionInfo();
-            } catch (RuntimeException e) {
-                Log.w(TAG, "Unable to read Wi-Fi signal", e);
-            }
+            try { info = wifiManager.getConnectionInfo(); }
+            catch (RuntimeException e) { Log.d(TAG, "WifiInfo unavailable", e); }
         }
-
         if (info == null) return 0;
         int rssi = info.getRssi();
         if (rssi <= -127) return 0;
-        int level = WifiManager.calculateSignalLevel(rssi, SIGNAL_LEVEL_COUNT);
-        return clampSignalLevel(level);
+        return clamp(WifiManager.calculateSignalLevel(rssi, LEVEL_COUNT));
     }
 
-    private int getCellularSignalLevel() {
-        if (telephonyManager != null) {
-            try {
-                SignalStrength signalStrength = telephonyManager.getSignalStrength();
-                if (signalStrength != null) {
-                    return clampSignalLevel(signalStrength.getLevel());
-                }
-            } catch (RuntimeException e) {
-                Log.w(TAG, "Unable to read cellular signal strength", e);
+    private int getCellularLevel() {
+        // NetworkCapabilities is attempted first because it does not require the
+        // dangerous READ_PHONE_STATE runtime permission.
+        if (connectivityManager != null) {
+            Network active = connectivityManager.getActiveNetwork();
+            NetworkCapabilities caps = active == null
+                    ? null : connectivityManager.getNetworkCapabilities(active);
+            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                int dbm = caps.getSignalStrength();
+                int mapped = mapDbm(dbm);
+                if (mapped >= 0) return mapped;
             }
         }
-
-        // Some vendors expose the current cellular level through NetworkCapabilities.
-        if (connectivityManager != null) {
-            Network network = connectivityManager.getActiveNetwork();
-            NetworkCapabilities capabilities = network == null
-                    ? null : connectivityManager.getNetworkCapabilities(network);
-            if (capabilities != null
-                    && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
-                int dbm = capabilities.getSignalStrength();
-                if (dbm != Integer.MIN_VALUE && dbm != -1) {
-                    if (dbm >= -80) return 4;
-                    if (dbm >= -90) return 3;
-                    if (dbm >= -100) return 2;
-                    if (dbm >= -110) return 1;
-                    return 0;
-                }
+        // Best effort fallback. Some devices restrict this API unless READ_PHONE_STATE
+        // has been granted; that case deliberately resolves to the lowest level.
+        if (telephonyManager != null) {
+            try {
+                SignalStrength signal = telephonyManager.getSignalStrength();
+                if (signal != null) return clamp(signal.getLevel());
+            } catch (RuntimeException e) {
+                Log.d(TAG, "Telephony signal API unavailable", e);
             }
         }
         return 0;
     }
 
-    private int clampSignalLevel(int level) {
-        return Math.max(0, Math.min(SIGNAL_LEVEL_COUNT - 1, level));
+    private int mapDbm(int dbm) {
+        if (dbm == Integer.MIN_VALUE || dbm == -1 || dbm >= 0) return -1;
+        if (dbm >= -80) return 4;
+        if (dbm >= -90) return 3;
+        if (dbm >= -100) return 2;
+        if (dbm >= -110) return 1;
+        return 0;
     }
 
-    private Icon getSystemSignalIcon(ActiveTransport transport) {
-        final String resourcePrefix;
-        final int level;
+    private int clamp(int level) { return Math.max(0, Math.min(4, level)); }
 
-        if (transport == ActiveTransport.CELLULAR) {
-            resourcePrefix = "stat_sys_signal_";
-            level = getCellularSignalLevel();
+    private Icon getLocalSignalIcon(Transport transport) {
+        final int resource;
+        if (transport == Transport.CELLULAR) {
+            resource = cellularIconForLevel(getCellularLevel());
+        } else if (transport == Transport.WIFI) {
+            resource = wifiIconForLevel(getWifiLevel());
         } else {
-            // Wi-Fi is also the intentional fallback when neither transport is active.
-            resourcePrefix = "stat_sys_wifi_signal_";
-            level = transport == ActiveTransport.WIFI ? getWifiSignalLevel() : 0;
+            // Required idle/off fallback: show the Wi-Fi glyph, not a generic icon.
+            resource = R.drawable.ic_wifi_4;
         }
-
-        // These are Android SystemUI's own Android 12-15 status-bar signal drawables.
-        // Using Icon's package/resource constructor keeps the glyph owned by SystemUI.
-        int systemResourceId = findSystemUiDrawable(resourcePrefix + level + "_fully");
-        if (systemResourceId == 0) {
-            systemResourceId = findSystemUiDrawable(resourcePrefix + level);
-        }
-        if (systemResourceId != 0) {
-            return Icon.createWithResource(SYSTEM_UI_PACKAGE, systemResourceId);
-        }
-
-        // Resource names can differ on OEM SystemUI builds. Keep the tile usable rather
-        // than showing a fabricated or malformed signal glyph.
-        Log.w(TAG, "SystemUI signal drawable not found: " + resourcePrefix + level);
-        return Icon.createWithResource(this, R.drawable.ic_internet);
+        return Icon.createWithResource(this, resource);
     }
 
-    private int findSystemUiDrawable(String name) {
-        try {
-            Resources resources = getPackageManager()
-                    .getResourcesForApplication(SYSTEM_UI_PACKAGE);
-            return resources.getIdentifier(name, "drawable", SYSTEM_UI_PACKAGE);
-        } catch (PackageManager.NameNotFoundException | RuntimeException e) {
-            Log.w(TAG, "Unable to access SystemUI drawable resources", e);
-            return 0;
+    private int wifiIconForLevel(int level) {
+        switch (clamp(level)) {
+            case 0: return R.drawable.ic_wifi_0;
+            case 1: return R.drawable.ic_wifi_1;
+            case 2: return R.drawable.ic_wifi_2;
+            case 3: return R.drawable.ic_wifi_3;
+            default: return R.drawable.ic_wifi_4;
         }
     }
 
-    private String getConnectionSubtitle(ActiveTransport transport) {
-        if (transport == ActiveTransport.WIFI) {
-            return getString(R.string.connection_wifi);
+    private int cellularIconForLevel(int level) {
+        switch (clamp(level)) {
+            case 0: return R.drawable.ic_cellular_0;
+            case 1: return R.drawable.ic_cellular_1;
+            case 2: return R.drawable.ic_cellular_2;
+            case 3: return R.drawable.ic_cellular_3;
+            default: return R.drawable.ic_cellular_4;
         }
-        if (transport == ActiveTransport.CELLULAR) {
-            return getString(R.string.connection_mobile);
-        }
+    }
+
+    private String getSubtitle(Transport transport) {
+        if (transport == Transport.WIFI) return getString(R.string.connection_wifi);
+        if (transport == Transport.CELLULAR) return getString(R.string.connection_mobile);
         return getString(R.string.connection_idle);
     }
 
-    private enum ActiveTransport {
-        NONE,
-        WIFI,
-        CELLULAR
-    }
+    private enum Transport { NONE, WIFI, CELLULAR }
 }
