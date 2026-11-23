@@ -419,18 +419,41 @@ public class InternetTileService extends TileService {
         Tile tile = getQsTile();
         if (tile == null) return;
 
+        boolean airplaneMode = isAirplaneModeEnabled();
         boolean wifiEnabled = isWifiEnabled();
         boolean mobileDataEnabled = isMobileDataEnabled();
-        boolean anyRadioEnabled = wifiEnabled || mobileDataEnabled;
         Transport transport = getActiveTransport();
+        boolean noInternet = isActiveTransportUnvalidated(transport);
 
         tile.setLabel(getString(R.string.tile_label));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            tile.setSubtitle(getSubtitle(transport));
+            tile.setSubtitle(airplaneMode
+                    ? getString(R.string.connection_airplane_mode)
+                    : getSubtitle(transport));
         }
-        tile.setIcon(getLocalSignalIcon(transport, wifiEnabled, mobileDataEnabled));
-        tile.setState(anyRadioEnabled ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
+        tile.setIcon(getLocalSignalIcon(transport, wifiEnabled, mobileDataEnabled,
+                airplaneMode, noInternet));
+        tile.setState(!airplaneMode && (wifiEnabled || mobileDataEnabled)
+                ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
         tile.updateTile();
+    }
+
+    private boolean isAirplaneModeEnabled() {
+        try {
+            return Settings.Global.getInt(getContentResolver(),
+                    Settings.Global.AIRPLANE_MODE_ON, 0) != 0;
+        } catch (RuntimeException e) {
+            Log.d(TAG, "Unable to read airplane mode state", e);
+            return false;
+        }
+    }
+
+    private boolean isActiveTransportUnvalidated(Transport transport) {
+        if (transport == Transport.NONE) return false;
+        NetworkCapabilities caps = lastDefaultCapabilities;
+        if (caps == null) return true;
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
+                || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
     }
 
     private boolean isWifiEnabled() {
@@ -463,9 +486,14 @@ public class InternetTileService extends TileService {
             Network active = connectivityManager.getActiveNetwork();
             caps = active == null ? null : connectivityManager.getNetworkCapabilities(active);
         }
-        if (caps == null) return Transport.NONE;
-        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return Transport.WIFI;
-        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return Transport.CELLULAR;
+        if (caps != null) {
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return Transport.WIFI;
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return Transport.CELLULAR;
+        }
+
+        // Preserve a cellular presentation when mobile data is enabled but there is no
+        // default route (for example, no service or no data network).
+        if (isMobileDataEnabled()) return Transport.CELLULAR;
         return Transport.NONE;
     }
 
@@ -532,12 +560,22 @@ public class InternetTileService extends TileService {
 
     private Icon getLocalSignalIcon(Transport transport,
                                     boolean wifiEnabled,
-                                    boolean mobileDataEnabled) {
+                                    boolean mobileDataEnabled,
+                                    boolean airplaneMode,
+                                    boolean noInternet) {
         final int resource;
-        if (transport == Transport.CELLULAR) {
-            resource = cellularIconForLevel(getCellularLevel());
+        if (airplaneMode) {
+            resource = R.drawable.ic_airplane_mode;
+        } else if (transport == Transport.CELLULAR) {
+            int level = getCellularLevel();
+            resource = noInternet
+                    ? cellularWarningIconForLevel(level)
+                    : cellularIconForLevel(level);
         } else if (transport == Transport.WIFI) {
-            resource = wifiIconForLevel(getWifiLevel());
+            int level = getWifiLevel();
+            resource = noInternet
+                    ? wifiWarningIconForLevel(level)
+                    : wifiIconForLevel(level);
         } else if (wifiEnabled) {
             resource = R.drawable.ic_wifi_0;
         } else if (mobileDataEnabled) {
@@ -546,6 +584,26 @@ public class InternetTileService extends TileService {
             resource = R.drawable.ic_wifi_off;
         }
         return Icon.createWithResource(this, resource);
+    }
+
+    private int wifiWarningIconForLevel(int level) {
+        switch (clamp(level)) {
+            case 0: return R.drawable.ic_wifi_0_warning;
+            case 1: return R.drawable.ic_wifi_1_warning;
+            case 2: return R.drawable.ic_wifi_2_warning;
+            case 3: return R.drawable.ic_wifi_3_warning;
+            default: return R.drawable.ic_wifi_4_warning;
+        }
+    }
+
+    private int cellularWarningIconForLevel(int level) {
+        switch (clamp(level)) {
+            case 0: return R.drawable.ic_cellular_0_warning;
+            case 1: return R.drawable.ic_cellular_1_warning;
+            case 2: return R.drawable.ic_cellular_2_warning;
+            case 3: return R.drawable.ic_cellular_3_warning;
+            default: return R.drawable.ic_cellular_4_warning;
+        }
     }
 
     private int wifiIconForLevel(int level) {
