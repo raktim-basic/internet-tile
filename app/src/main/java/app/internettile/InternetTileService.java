@@ -575,18 +575,13 @@ public class InternetTileService extends TileService {
     }
 
     private String getWifiNetworkName() {
-        if (!hasFineLocationPermission()) {
-            lastKnownSsid = null;
-            lastWifiInfo = null;
-            lastWifiNetwork = null;
-            return getString(R.string.connection_wifi_fallback);
-        }
-
+        // Do not use the permission check as a gate here. It is useful for deciding whether
+        // to request location-bearing NetworkCapabilities, but it must not suppress the
+        // independent WifiManager retrieval attempt. The platform will enforce access and
+        // either return a usable SSID or UNKNOWN_SSID / throw SecurityException.
         String cachedSsid = lastKnownSsid;
         if (isUsableSsid(cachedSsid)) return cachedSsid;
 
-        // Secondary attempt only. The default-network callback remains the primary source
-        // on Android 12+, because this API may return a redacted SSID on newer releases.
         if (wifiManager != null) {
             try {
                 WifiInfo candidate = wifiManager.getConnectionInfo();
@@ -594,17 +589,33 @@ public class InternetTileService extends TileService {
                 if (isUsableSsid(ssid)) {
                     lastKnownSsid = ssid;
                     lastWifiInfo = candidate;
-                    Log.d(TAG, "Cached SSID string from WifiManager fallback");
+                    Log.d(TAG, "Cached SSID string from WifiManager; fineLocation="
+                            + hasFineLocationPermission() + ", locationEnabled="
+                            + isLocationEnabled());
                     return ssid;
                 }
-                Log.d(TAG, "WifiManager fallback returned redacted/unknown SSID");
+                Log.d(TAG, "WifiManager returned no usable SSID; fineLocation="
+                        + hasFineLocationPermission() + ", locationEnabled="
+                        + isLocationEnabled() + ", candidateNull=" + (candidate == null));
             } catch (SecurityException e) {
-                Log.d(TAG, "Wi-Fi SSID access denied", e);
+                Log.w(TAG, "WifiManager SSID access denied; fineLocation="
+                        + hasFineLocationPermission(), e);
             } catch (RuntimeException e) {
-                Log.d(TAG, "WifiManager SSID fallback unavailable", e);
+                Log.w(TAG, "WifiManager SSID retrieval failed", e);
             }
+        } else {
+            Log.w(TAG, "WifiManager service unavailable while retrieving SSID");
         }
         return getString(R.string.connection_wifi_fallback);
+    }
+
+    private boolean isLocationEnabled() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            android.location.LocationManager locationManager =
+                    getSystemService(android.location.LocationManager.class);
+            return locationManager != null && locationManager.isLocationEnabled();
+        }
+        return true;
     }
 
     private String getMobileNetworkName() {
