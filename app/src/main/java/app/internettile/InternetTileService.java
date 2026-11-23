@@ -47,6 +47,7 @@ public class InternetTileService extends TileService {
     private volatile Network lastDefaultNetwork;
     private volatile NetworkCapabilities lastCellularCapabilities;
     private volatile WifiInfo lastWifiInfo;
+    private volatile Network lastWifiNetwork;
     private volatile Integer lastCellularLevel;
     private volatile TelephonyDisplayInfo lastDisplayInfo;
 
@@ -71,6 +72,11 @@ public class InternetTileService extends TileService {
 
     @Override public void onStartListening() {
         super.onStartListening();
+        // SSID is location-sensitive. Never retain a name across a permission revocation.
+        if (!hasFineLocationPermission()) {
+            lastWifiInfo = null;
+            lastWifiNetwork = null;
+        }
         registerListeners();
         refreshDefaultNetworkSnapshot();
         updateTile();
@@ -173,7 +179,10 @@ public class InternetTileService extends TileService {
                     if (network.equals(lastDefaultNetwork)) {
                         lastDefaultNetwork = null;
                         lastDefaultCapabilities = null;
+                    }
+                    if (network.equals(lastWifiNetwork)) {
                         lastWifiInfo = null;
+                        lastWifiNetwork = null;
                     }
                     updateTile();
                 }
@@ -182,7 +191,7 @@ public class InternetTileService extends TileService {
                         Network network, NetworkCapabilities capabilities) {
                     lastDefaultNetwork = network;
                     lastDefaultCapabilities = capabilities;
-                    cacheWifiInfo(capabilities);
+                    cacheWifiInfo(network, capabilities);
                     updateTile();
                 }
 
@@ -201,7 +210,10 @@ public class InternetTileService extends TileService {
                     if (network.equals(lastDefaultNetwork)) {
                         lastDefaultNetwork = null;
                         lastDefaultCapabilities = null;
+                    }
+                    if (network.equals(lastWifiNetwork)) {
                         lastWifiInfo = null;
+                        lastWifiNetwork = null;
                     }
                     updateTile();
                 }
@@ -210,7 +222,7 @@ public class InternetTileService extends TileService {
                         Network network, NetworkCapabilities capabilities) {
                     lastDefaultNetwork = network;
                     lastDefaultCapabilities = capabilities;
-                    cacheWifiInfo(capabilities);
+                    cacheWifiInfo(network, capabilities);
                     updateTile();
                 }
 
@@ -297,24 +309,54 @@ public class InternetTileService extends TileService {
             if (capabilities != null) {
                 lastDefaultNetwork = active;
                 lastDefaultCapabilities = capabilities;
-                cacheWifiInfo(capabilities);
+                if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    lastWifiInfo = null;
+                    lastWifiNetwork = null;
+                } else if (lastWifiNetwork != null && !lastWifiNetwork.equals(active)) {
+                    // A different Wi-Fi network is active; don't show the previous SSID.
+                    lastWifiInfo = null;
+                    lastWifiNetwork = active;
+                }
+                // Do not cache WifiInfo from getNetworkCapabilities(): on Android 12+
+                // this snapshot can redact location-sensitive SSID information.
             } else {
                 lastDefaultNetwork = null;
                 lastDefaultCapabilities = null;
                 lastWifiInfo = null;
+                lastWifiNetwork = null;
             }
         } catch (RuntimeException e) {
             Log.d(TAG, "Unable to refresh default network", e);
         }
     }
 
-    private void cacheWifiInfo(NetworkCapabilities capabilities) {
+    private void cacheWifiInfo(Network network, NetworkCapabilities capabilities) {
         if (capabilities == null
                 || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return;
+
+        if (lastWifiNetwork != null && !lastWifiNetwork.equals(network)) {
+            // A new Wi-Fi network must not inherit the previous network's cached name.
+            lastWifiInfo = null;
+        }
+        lastWifiNetwork = network;
+
+        if (!hasFineLocationPermission()) return;
+
         Object transportInfo = capabilities.getTransportInfo();
         if (transportInfo instanceof WifiInfo) {
-            lastWifiInfo = (WifiInfo) transportInfo;
+            WifiInfo candidate = (WifiInfo) transportInfo;
+            if (isUsableSsid(candidate.getSSID())) {
+                lastWifiInfo = candidate;
+            }
+            // Unknown/redacted callback data must never overwrite a valid cached SSID.
         }
+    }
+
+    private boolean isUsableSsid(String ssid) {
+        return ssid != null && !ssid.isEmpty()
+                && !WifiManager.UNKNOWN_SSID.equals(ssid)
+                && !"<unknown ssid>".equalsIgnoreCase(ssid)
+                && !"<none>".equalsIgnoreCase(ssid);
     }
 
     private void updateTile() {
@@ -386,7 +428,9 @@ public class InternetTileService extends TileService {
             try {
                 info = wifiManager.getConnectionInfo();
                 if (info != null) {
-                    lastWifiInfo = info;
+                    if (hasFineLocationPermission() && isUsableSsid(info.getSSID())) {
+                        lastWifiInfo = info;
+                    }
                     return info;
                 }
             } catch (SecurityException e) {
@@ -480,13 +524,15 @@ public class InternetTileService extends TileService {
     }
 
     private String getWifiNetworkName() {
+        if (!hasFineLocationPermission()) {
+            return getString(R.string.connection_wifi_fallback);
+        }
         WifiInfo info = getCurrentWifiInfo();
         if (info == null) return getString(R.string.connection_wifi_fallback);
         String ssid;
         try { ssid = info.getSSID(); }
         catch (RuntimeException e) { return getString(R.string.connection_wifi_fallback); }
-        if (ssid == null || ssid.isEmpty() || WifiManager.UNKNOWN_SSID.equals(ssid)
-                || "<unknown ssid>".equalsIgnoreCase(ssid)) {
+        if (!isUsableSsid(ssid)) {
             return getString(R.string.connection_wifi_fallback);
         }
         if (ssid.length() >= 2 && ssid.startsWith("\"") && ssid.endsWith("\"")) {
