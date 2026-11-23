@@ -47,6 +47,8 @@ public class InternetTileService extends TileService {
     private volatile Network lastDefaultNetwork;
     private volatile NetworkCapabilities lastCellularCapabilities;
     private volatile WifiInfo lastWifiInfo;
+    private volatile String lastKnownSsid;
+    private volatile Network lastWifiNetwork;
     private volatile Integer lastCellularLevel;
     private volatile TelephonyDisplayInfo lastDisplayInfo;
 
@@ -72,7 +74,12 @@ public class InternetTileService extends TileService {
     @Override public void onStartListening() {
         super.onStartListening();
         // Do not retain a previously exposed SSID after location permission is revoked.
-        if (!hasFineLocationPermission()) lastWifiInfo = null;
+        if (!hasFineLocationPermission()) {
+            lastWifiInfo = null;
+            lastKnownSsid = null;
+            lastWifiNetwork = null;
+            Log.d(TAG, "Cleared cached Wi-Fi identity: fine location permission unavailable");
+        }
         registerListeners();
         refreshDefaultNetworkSnapshot();
         updateTile();
@@ -163,24 +170,25 @@ public class InternetTileService extends TileService {
     }
 
     private ConnectivityManager.NetworkCallback createNetworkCallback() {
-        ConnectivityManager.NetworkCallback callback;
         boolean includeLocationInfo = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                 && hasFineLocationPermission();
         Log.d(TAG, "Creating default-network callback; fineLocation="
                 + hasFineLocationPermission() + ", includeLocationInfo=" + includeLocationInfo);
+
+        ConnectivityManager.NetworkCallback callback;
         if (includeLocationInfo) {
             callback = new ConnectivityManager.NetworkCallback(
                     ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO) {
                 @Override public void onAvailable(Network network) {
-                    // Wait for onCapabilitiesChanged before reading the new default route.
+                    Log.d(TAG, "Default network available");
                 }
 
                 @Override public void onLost(Network network) {
                     if (network.equals(lastDefaultNetwork)) {
                         lastDefaultNetwork = null;
                         lastDefaultCapabilities = null;
-                        lastWifiInfo = null;
                     }
+                    clearWifiIdentityForNetwork(network);
                     updateTile();
                 }
 
@@ -188,7 +196,7 @@ public class InternetTileService extends TileService {
                         Network network, NetworkCapabilities capabilities) {
                     lastDefaultNetwork = network;
                     lastDefaultCapabilities = capabilities;
-                    cacheWifiInfo(capabilities);
+                    cacheWifiSsidFromCallback(network, capabilities);
                     updateTile();
                 }
 
@@ -200,15 +208,15 @@ public class InternetTileService extends TileService {
         } else {
             callback = new ConnectivityManager.NetworkCallback() {
                 @Override public void onAvailable(Network network) {
-                    // Wait for onCapabilitiesChanged before reading the new default route.
+                    Log.d(TAG, "Default network available (without location info)");
                 }
 
                 @Override public void onLost(Network network) {
                     if (network.equals(lastDefaultNetwork)) {
                         lastDefaultNetwork = null;
                         lastDefaultCapabilities = null;
-                        lastWifiInfo = null;
                     }
+                    clearWifiIdentityForNetwork(network);
                     updateTile();
                 }
 
@@ -216,7 +224,9 @@ public class InternetTileService extends TileService {
                         Network network, NetworkCapabilities capabilities) {
                     lastDefaultNetwork = network;
                     lastDefaultCapabilities = capabilities;
-                    cacheWifiInfo(capabilities);
+                    // This callback intentionally has no location flag. Do not use its
+                    // potentially redacted WifiInfo to replace the SSID cache.
+                    logWifiCallbackAvailability(capabilities, false);
                     updateTile();
                 }
 
@@ -303,35 +313,82 @@ public class InternetTileService extends TileService {
             if (capabilities != null) {
                 lastDefaultNetwork = active;
                 lastDefaultCapabilities = capabilities;
-                cacheWifiInfo(capabilities);
             } else {
                 lastDefaultNetwork = null;
                 lastDefaultCapabilities = null;
-                lastWifiInfo = null;
             }
         } catch (RuntimeException e) {
             Log.d(TAG, "Unable to refresh default network", e);
         }
     }
 
-    private void cacheWifiInfo(NetworkCapabilities capabilities) {
+    private void cacheWifiSsidFromCallback(Network network, NetworkCapabilities capabilities) {
         if (capabilities == null
-                || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return;
+                || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            clearWifiIdentityIfNetworkChanged(network);
+            return;
+        }
+
+        Network previousNetwork = lastWifiNetwork;
+        if (previousNetwork != null && !previousNetwork.equals(network)) {
+            lastKnownSsid = null;
+            lastWifiInfo = null;
+            Log.d(TAG, "Wi-Fi network identity changed; discarded previous SSID");
+        }
+        lastWifiNetwork = network;
+
         Object transportInfo = capabilities.getTransportInfo();
         if (!(transportInfo instanceof WifiInfo)) {
-            Log.d(TAG, "Wi-Fi snapshot has no WifiInfo transport data");
+            Log.d(TAG, "Location-aware callback supplied no WifiInfo transport data");
             return;
         }
 
         WifiInfo candidate = (WifiInfo) transportInfo;
-        String ssid = safeSsid(candidate);
+        String ssid = normalizeSsid(safeSsid(candidate));
         if (isUsableSsid(ssid)) {
+            lastKnownSsid = ssid;
             lastWifiInfo = candidate;
-            Log.d(TAG, "Cached usable SSID from network capabilities");
+            Log.d(TAG, "Cached SSID string from location-aware network callback");
         } else {
-            Log.d(TAG, "Ignored redacted/unknown SSID from network capabilities; fineLocation="
-                    + hasFineLocationPermission());
+            Log.d(TAG, "Location-aware callback returned redacted/unknown SSID; cache preserved");
         }
+    }
+
+    private void logWifiCallbackAvailability(NetworkCapabilities capabilities,
+                                             boolean includesLocationInfo) {
+        if (capabilities == null
+                || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return;
+        Object info = capabilities.getTransportInfo();
+        Log.d(TAG, "Wi-Fi callback: includeLocationInfo=" + includesLocationInfo
+                + ", hasWifiInfo=" + (info instanceof WifiInfo));
+    }
+
+    private void clearWifiIdentityForNetwork(Network network) {
+        Network cachedNetwork = lastWifiNetwork;
+        if (cachedNetwork != null && cachedNetwork.equals(network)) {
+            lastWifiNetwork = null;
+            lastKnownSsid = null;
+            lastWifiInfo = null;
+            Log.d(TAG, "Cleared cached SSID because its network was lost");
+        }
+    }
+
+    private void clearWifiIdentityIfNetworkChanged(Network currentNetwork) {
+        Network cachedNetwork = lastWifiNetwork;
+        if (cachedNetwork != null && !cachedNetwork.equals(currentNetwork)) {
+            lastWifiNetwork = null;
+            lastKnownSsid = null;
+            lastWifiInfo = null;
+            Log.d(TAG, "Cleared cached SSID after default network changed away from Wi-Fi");
+        }
+    }
+
+    private String normalizeSsid(String ssid) {
+        if (ssid == null) return null;
+        if (ssid.length() >= 2 && ssid.startsWith("\"") && ssid.endsWith("\"")) {
+            return ssid.substring(1, ssid.length() - 1);
+        }
+        return ssid;
     }
 
     private String safeSsid(WifiInfo info) {
@@ -518,14 +575,36 @@ public class InternetTileService extends TileService {
     }
 
     private String getWifiNetworkName() {
-        WifiInfo info = getCurrentWifiInfo();
-        if (info == null) return getString(R.string.connection_wifi_fallback);
-        String ssid = safeSsid(info);
-        if (!isUsableSsid(ssid)) return getString(R.string.connection_wifi_fallback);
-        if (ssid.length() >= 2 && ssid.startsWith("\"") && ssid.endsWith("\"")) {
-            ssid = ssid.substring(1, ssid.length() - 1);
+        if (!hasFineLocationPermission()) {
+            lastKnownSsid = null;
+            lastWifiInfo = null;
+            lastWifiNetwork = null;
+            return getString(R.string.connection_wifi_fallback);
         }
-        return ssid;
+
+        String cachedSsid = lastKnownSsid;
+        if (isUsableSsid(cachedSsid)) return cachedSsid;
+
+        // Secondary attempt only. The default-network callback remains the primary source
+        // on Android 12+, because this API may return a redacted SSID on newer releases.
+        if (wifiManager != null) {
+            try {
+                WifiInfo candidate = wifiManager.getConnectionInfo();
+                String ssid = normalizeSsid(safeSsid(candidate));
+                if (isUsableSsid(ssid)) {
+                    lastKnownSsid = ssid;
+                    lastWifiInfo = candidate;
+                    Log.d(TAG, "Cached SSID string from WifiManager fallback");
+                    return ssid;
+                }
+                Log.d(TAG, "WifiManager fallback returned redacted/unknown SSID");
+            } catch (SecurityException e) {
+                Log.d(TAG, "Wi-Fi SSID access denied", e);
+            } catch (RuntimeException e) {
+                Log.d(TAG, "WifiManager SSID fallback unavailable", e);
+            }
+        }
+        return getString(R.string.connection_wifi_fallback);
     }
 
     private String getMobileNetworkName() {
