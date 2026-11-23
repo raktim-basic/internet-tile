@@ -29,6 +29,8 @@ import android.util.Log;
 
 
 public class InternetTileService extends TileService {
+    private enum Transport { NONE, WIFI, CELLULAR }
+
     private static final String TAG = "InternetTile";
     private static final int LEVEL_COUNT = 5;
 
