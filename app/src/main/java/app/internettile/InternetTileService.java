@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.drawable.Icon;
 import android.net.ConnectivityManager;
@@ -33,6 +34,9 @@ public class InternetTileService extends TileService {
 
     private static final String TAG = "InternetTile";
     private static final int LEVEL_COUNT = 5;
+    private static final String PREFS_NETWORK_LABELS = "network_labels";
+    private static final String PREF_WIFI_SSID = "wifi_ssid";
+    private static final String PREF_WIFI_NETWORK_HANDLE = "wifi_network_handle";
 
     private ConnectivityManager connectivityManager;
     private WifiManager wifiManager;
@@ -46,7 +50,11 @@ public class InternetTileService extends TileService {
     private volatile NetworkCapabilities lastDefaultCapabilities;
     private volatile Network lastDefaultNetwork;
     private volatile NetworkCapabilities lastCellularCapabilities;
+    // WifiInfo is retained only for signal strength. SSID is cached separately because
+    // Android may redact it from later WifiInfo instances even while RSSI remains usable.
     private volatile WifiInfo lastWifiInfo;
+    private volatile String lastKnownSsid;
+    private volatile long lastSsidNetworkHandle = -1L;
     private volatile Integer lastCellularLevel;
     private volatile TelephonyDisplayInfo lastDisplayInfo;
 
@@ -164,11 +172,11 @@ public class InternetTileService extends TileService {
 
     private ConnectivityManager.NetworkCallback createNetworkCallback() {
         ConnectivityManager.NetworkCallback callback;
-        boolean includeLocationInfo = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-                && hasFineLocationPermission();
-        Log.d(TAG, "Creating default-network callback; fineLocation="
-                + hasFineLocationPermission() + ", includeLocationInfo=" + includeLocationInfo);
-        if (includeLocationInfo) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Register consistently with location-aware delivery enabled. Android still
+            // enforces runtime permission and Location Services state when delivering data.
+            Log.d(TAG, "Creating location-aware default-network callback; fineLocation="
+                    + hasFineLocationPermission());
             callback = new ConnectivityManager.NetworkCallback(
                     ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO) {
                 @Override public void onAvailable(Network network) {
@@ -180,6 +188,7 @@ public class InternetTileService extends TileService {
                         lastDefaultNetwork = null;
                         lastDefaultCapabilities = null;
                         lastWifiInfo = null;
+                        clearWifiSsidCache();
                     }
                     updateTile();
                 }
@@ -188,7 +197,7 @@ public class InternetTileService extends TileService {
                         Network network, NetworkCapabilities capabilities) {
                     lastDefaultNetwork = network;
                     lastDefaultCapabilities = capabilities;
-                    cacheWifiInfo(capabilities);
+                    cacheWifiInfo(network, capabilities);
                     updateTile();
                 }
 
@@ -208,6 +217,7 @@ public class InternetTileService extends TileService {
                         lastDefaultNetwork = null;
                         lastDefaultCapabilities = null;
                         lastWifiInfo = null;
+                        clearWifiSsidCache();
                     }
                     updateTile();
                 }
@@ -216,7 +226,7 @@ public class InternetTileService extends TileService {
                         Network network, NetworkCapabilities capabilities) {
                     lastDefaultNetwork = network;
                     lastDefaultCapabilities = capabilities;
-                    cacheWifiInfo(capabilities);
+                    cacheWifiInfo(network, capabilities);
                     updateTile();
                 }
 
@@ -303,35 +313,81 @@ public class InternetTileService extends TileService {
             if (capabilities != null) {
                 lastDefaultNetwork = active;
                 lastDefaultCapabilities = capabilities;
-                cacheWifiInfo(capabilities);
+                // Snapshot capabilities are useful for transport and RSSI, but Android
+                // strips location-sensitive WifiInfo fields from this synchronous API.
+                Object transportInfo = capabilities.getTransportInfo();
+                if (transportInfo instanceof WifiInfo) lastWifiInfo = (WifiInfo) transportInfo;
+                if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    restoreWifiSsidForNetwork(active);
+                } else {
+                    clearWifiSsidCache();
+                }
             } else {
                 lastDefaultNetwork = null;
                 lastDefaultCapabilities = null;
                 lastWifiInfo = null;
+                clearWifiSsidCache();
             }
         } catch (RuntimeException e) {
             Log.d(TAG, "Unable to refresh default network", e);
         }
     }
 
-    private void cacheWifiInfo(NetworkCapabilities capabilities) {
+    private void cacheWifiInfo(Network network, NetworkCapabilities capabilities) {
         if (capabilities == null
                 || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return;
+
         Object transportInfo = capabilities.getTransportInfo();
-        if (!(transportInfo instanceof WifiInfo)) {
-            Log.d(TAG, "Wi-Fi snapshot has no WifiInfo transport data");
+        if (transportInfo instanceof WifiInfo) {
+            WifiInfo candidate = (WifiInfo) transportInfo;
+            // Keep WifiInfo for RSSI even when SSID is redacted.
+            lastWifiInfo = candidate;
+            String ssid = normalizeSsid(safeSsid(candidate));
+            if (isUsableSsid(ssid)) {
+                long handle = network.getNetworkHandle();
+                lastKnownSsid = ssid;
+                lastSsidNetworkHandle = handle;
+                getSharedPreferences(PREFS_NETWORK_LABELS, MODE_PRIVATE).edit()
+                        .putString(PREF_WIFI_SSID, ssid)
+                        .putLong(PREF_WIFI_NETWORK_HANDLE, handle)
+                        .apply();
+                Log.d(TAG, "Cached Wi-Fi SSID for active network");
+            } else {
+                Log.d(TAG, "Wi-Fi SSID redacted; retaining cache only for matching network");
+                restoreWifiSsidForNetwork(network);
+            }
+        } else {
+            Log.d(TAG, "Wi-Fi capabilities contain no WifiInfo transport data");
+            restoreWifiSsidForNetwork(network);
+        }
+    }
+
+    private void restoreWifiSsidForNetwork(Network network) {
+        if (!hasFineLocationPermission()) {
+            clearWifiSsidCache();
             return;
         }
+        long handle = network.getNetworkHandle();
+        if (lastKnownSsid != null && lastSsidNetworkHandle == handle) return;
 
-        WifiInfo candidate = (WifiInfo) transportInfo;
-        String ssid = safeSsid(candidate);
-        if (isUsableSsid(ssid)) {
-            lastWifiInfo = candidate;
-            Log.d(TAG, "Cached usable SSID from network capabilities");
+        SharedPreferences prefs = getSharedPreferences(PREFS_NETWORK_LABELS, MODE_PRIVATE);
+        String cached = prefs.getString(PREF_WIFI_SSID, null);
+        long cachedHandle = prefs.getLong(PREF_WIFI_NETWORK_HANDLE, -1L);
+        if (isUsableSsid(cached) && cachedHandle == handle) {
+            lastKnownSsid = cached;
+            lastSsidNetworkHandle = cachedHandle;
         } else {
-            Log.d(TAG, "Ignored redacted/unknown SSID from network capabilities; fineLocation="
-                    + hasFineLocationPermission());
+            clearWifiSsidCache();
         }
+    }
+
+    private void clearWifiSsidCache() {
+        lastKnownSsid = null;
+        lastSsidNetworkHandle = -1L;
+        getSharedPreferences(PREFS_NETWORK_LABELS, MODE_PRIVATE).edit()
+                .remove(PREF_WIFI_SSID)
+                .remove(PREF_WIFI_NETWORK_HANDLE)
+                .apply();
     }
 
     private String safeSsid(WifiInfo info) {
@@ -341,6 +397,15 @@ public class InternetTileService extends TileService {
             Log.d(TAG, "Could not read SSID from WifiInfo", e);
             return null;
         }
+    }
+
+    private String normalizeSsid(String ssid) {
+        if (ssid == null) return null;
+        String value = ssid.trim();
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+            value = value.substring(1, value.length() - 1);
+        }
+        return value;
     }
 
     private boolean isUsableSsid(String ssid) {
@@ -354,18 +419,41 @@ public class InternetTileService extends TileService {
         Tile tile = getQsTile();
         if (tile == null) return;
 
+        boolean airplaneMode = isAirplaneModeEnabled();
         boolean wifiEnabled = isWifiEnabled();
         boolean mobileDataEnabled = isMobileDataEnabled();
-        boolean anyRadioEnabled = wifiEnabled || mobileDataEnabled;
         Transport transport = getActiveTransport();
+        boolean noInternet = isActiveTransportUnvalidated(transport);
 
         tile.setLabel(getString(R.string.tile_label));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            tile.setSubtitle(getSubtitle(transport));
+            tile.setSubtitle(airplaneMode
+                    ? getString(R.string.connection_airplane_mode)
+                    : getSubtitle(transport));
         }
-        tile.setIcon(getLocalSignalIcon(transport, wifiEnabled, mobileDataEnabled));
-        tile.setState(anyRadioEnabled ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
+        tile.setIcon(getLocalSignalIcon(transport, wifiEnabled, mobileDataEnabled,
+                airplaneMode, noInternet));
+        tile.setState(!airplaneMode && (wifiEnabled || mobileDataEnabled)
+                ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
         tile.updateTile();
+    }
+
+    private boolean isAirplaneModeEnabled() {
+        try {
+            return Settings.Global.getInt(getContentResolver(),
+                    Settings.Global.AIRPLANE_MODE_ON, 0) != 0;
+        } catch (RuntimeException e) {
+            Log.d(TAG, "Unable to read airplane mode state", e);
+            return false;
+        }
+    }
+
+    private boolean isActiveTransportUnvalidated(Transport transport) {
+        if (transport == Transport.NONE) return false;
+        NetworkCapabilities caps = lastDefaultCapabilities;
+        if (caps == null) return true;
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
+                || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
     }
 
     private boolean isWifiEnabled() {
@@ -398,9 +486,14 @@ public class InternetTileService extends TileService {
             Network active = connectivityManager.getActiveNetwork();
             caps = active == null ? null : connectivityManager.getNetworkCapabilities(active);
         }
-        if (caps == null) return Transport.NONE;
-        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return Transport.WIFI;
-        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return Transport.CELLULAR;
+        if (caps != null) {
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return Transport.WIFI;
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return Transport.CELLULAR;
+        }
+
+        // Preserve a cellular presentation when mobile data is enabled but there is no
+        // default route (for example, no service or no data network).
+        if (isMobileDataEnabled()) return Transport.CELLULAR;
         return Transport.NONE;
     }
 
@@ -413,27 +506,19 @@ public class InternetTileService extends TileService {
     }
 
     private WifiInfo getCurrentWifiInfo() {
-        WifiInfo cached = lastWifiInfo;
-        if (cached != null && isUsableSsid(safeSsid(cached))) return cached;
-
+        WifiInfo info = lastWifiInfo;
+        if (info != null) return info;
         if (wifiManager != null) {
             try {
-                WifiInfo candidate = wifiManager.getConnectionInfo();
-                if (candidate != null && isUsableSsid(safeSsid(candidate))) {
-                    lastWifiInfo = candidate;
-                    Log.d(TAG, "Cached usable SSID from WifiManager fallback");
-                    return candidate;
-                }
-                Log.d(TAG, "WifiManager fallback returned redacted/unknown SSID; fineLocation="
-                        + hasFineLocationPermission());
+                info = wifiManager.getConnectionInfo();
+                if (info != null) lastWifiInfo = info;
             } catch (SecurityException e) {
                 Log.d(TAG, "Wi-Fi details require location permission", e);
             } catch (RuntimeException e) {
                 Log.d(TAG, "WifiInfo unavailable", e);
             }
         }
-        // Preserve a previously valid value; never replace it with a redacted WifiInfo.
-        return cached;
+        return info;
     }
 
     private int getCellularLevel() {
@@ -475,12 +560,22 @@ public class InternetTileService extends TileService {
 
     private Icon getLocalSignalIcon(Transport transport,
                                     boolean wifiEnabled,
-                                    boolean mobileDataEnabled) {
+                                    boolean mobileDataEnabled,
+                                    boolean airplaneMode,
+                                    boolean noInternet) {
         final int resource;
-        if (transport == Transport.CELLULAR) {
-            resource = cellularIconForLevel(getCellularLevel());
+        if (airplaneMode) {
+            resource = R.drawable.ic_airplane_mode;
+        } else if (transport == Transport.CELLULAR) {
+            int level = getCellularLevel();
+            resource = noInternet
+                    ? cellularWarningIconForLevel(level)
+                    : cellularIconForLevel(level);
         } else if (transport == Transport.WIFI) {
-            resource = wifiIconForLevel(getWifiLevel());
+            int level = getWifiLevel();
+            resource = noInternet
+                    ? wifiWarningIconForLevel(level)
+                    : wifiIconForLevel(level);
         } else if (wifiEnabled) {
             resource = R.drawable.ic_wifi_0;
         } else if (mobileDataEnabled) {
@@ -489,6 +584,26 @@ public class InternetTileService extends TileService {
             resource = R.drawable.ic_wifi_off;
         }
         return Icon.createWithResource(this, resource);
+    }
+
+    private int wifiWarningIconForLevel(int level) {
+        switch (clamp(level)) {
+            case 0: return R.drawable.ic_wifi_0_warning;
+            case 1: return R.drawable.ic_wifi_1_warning;
+            case 2: return R.drawable.ic_wifi_2_warning;
+            case 3: return R.drawable.ic_wifi_3_warning;
+            default: return R.drawable.ic_wifi_4_warning;
+        }
+    }
+
+    private int cellularWarningIconForLevel(int level) {
+        switch (clamp(level)) {
+            case 0: return R.drawable.ic_cellular_0_warning;
+            case 1: return R.drawable.ic_cellular_1_warning;
+            case 2: return R.drawable.ic_cellular_2_warning;
+            case 3: return R.drawable.ic_cellular_3_warning;
+            default: return R.drawable.ic_cellular_4_warning;
+        }
     }
 
     private int wifiIconForLevel(int level) {
@@ -518,14 +633,18 @@ public class InternetTileService extends TileService {
     }
 
     private String getWifiNetworkName() {
-        WifiInfo info = getCurrentWifiInfo();
-        if (info == null) return getString(R.string.connection_wifi_fallback);
-        String ssid = safeSsid(info);
-        if (!isUsableSsid(ssid)) return getString(R.string.connection_wifi_fallback);
-        if (ssid.length() >= 2 && ssid.startsWith("\"") && ssid.endsWith("\"")) {
-            ssid = ssid.substring(1, ssid.length() - 1);
+        Network network = lastDefaultNetwork;
+        if (network == null || lastDefaultCapabilities == null
+                || !lastDefaultCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            return getString(R.string.connection_wifi_fallback);
         }
-        return ssid;
+        if (!hasFineLocationPermission()) {
+            clearWifiSsidCache();
+            return getString(R.string.connection_wifi_fallback);
+        }
+        restoreWifiSsidForNetwork(network);
+        String ssid = lastKnownSsid;
+        return isUsableSsid(ssid) ? ssid : getString(R.string.connection_wifi_fallback);
     }
 
     private String getMobileNetworkName() {

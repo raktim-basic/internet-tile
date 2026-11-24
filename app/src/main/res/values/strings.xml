@@ -5,4 +5,5 @@
     <string name="connection_wifi_fallback">Wi-Fi</string>
     <string name="connection_mobile_fallback">Mobile data</string>
     <string name="connection_idle">No connection</string>
+    <string name="connection_airplane_mode">Aeroplane mode</string>
 </resources>
