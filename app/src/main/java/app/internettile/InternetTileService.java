@@ -46,6 +46,10 @@ public class InternetTileService extends TileService {
     private ConnectivityManager.NetworkCallback cellularNetworkCallback;
     private TelephonyCallback telephonyCallback;
     private boolean receiverRegistered;
+    private volatile boolean listening;
+    private boolean dataEnabledApiDenied;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable updateRunnable = this::updateTileNow;
 
     private volatile NetworkCapabilities lastDefaultCapabilities;
     private volatile Network lastDefaultNetwork;
@@ -60,13 +64,17 @@ public class InternetTileService extends TileService {
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
-            String action = intent == null ? null : intent.getAction();
-            if (isDataSubscriptionChangeAction(action)) {
-                unregisterTelephonyListener();
-                registerTelephonyListener();
+            try {
+                String action = intent == null ? null : intent.getAction();
+                if (isDataSubscriptionChangeAction(action)) {
+                    unregisterTelephonyListener();
+                    registerTelephonyListener();
+                }
+                refreshDefaultNetworkSnapshot();
+                updateTile();
+            } catch (RuntimeException e) {
+                Log.e(TAG, "State receiver failed", e);
             }
-            refreshDefaultNetworkSnapshot();
-            updateTile();
         }
     };
 
@@ -79,14 +87,17 @@ public class InternetTileService extends TileService {
 
     @Override public void onStartListening() {
         super.onStartListening();
+        listening = true;
         // Do not retain a previously exposed SSID after location permission is revoked.
         if (!hasFineLocationPermission()) lastWifiInfo = null;
         registerListeners();
         refreshDefaultNetworkSnapshot();
-        updateTile();
+        updateTileNow();
     }
 
     @Override public void onStopListening() {
+        listening = false;
+        mainHandler.removeCallbacks(updateRunnable);
         unregisterListeners();
         super.onStopListening();
     }
@@ -415,7 +426,24 @@ public class InternetTileService extends TileService {
                 && !"<none>".equalsIgnoreCase(ssid);
     }
 
+    /** Coalesces bursts of callbacks into one tile update and ignores late events. */
     private void updateTile() {
+        if (!listening) return;
+        mainHandler.removeCallbacks(updateRunnable);
+        mainHandler.postDelayed(updateRunnable, 30);
+    }
+
+    /** Never let an exception escape a callback: it would kill the tile's process. */
+    private void updateTileNow() {
+        if (!listening) return;
+        try {
+            renderTile();
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Tile update failed", e);
+        }
+    }
+
+    private void renderTile() {
         Tile tile = getQsTile();
         if (tile == null) return;
 
@@ -466,9 +494,12 @@ public class InternetTileService extends TileService {
     }
 
     private boolean isMobileDataEnabled() {
-        if (baseTelephonyManager != null) {
+        if (baseTelephonyManager != null && !dataEnabledApiDenied) {
             try { return baseTelephonyManager.isDataEnabled(); }
-            catch (RuntimeException e) {
+            catch (SecurityException e) {
+                dataEnabledApiDenied = true;
+                Log.d(TAG, "isDataEnabled() denied; using Settings fallback from now on");
+            } catch (RuntimeException e) {
                 Log.d(TAG, "Telephony data-state API unavailable; trying Settings fallback", e);
             }
         }
@@ -498,11 +529,45 @@ public class InternetTileService extends TileService {
     }
 
     private int getWifiLevel() {
-        WifiInfo info = getCurrentWifiInfo();
-        if (info == null) return 0;
-        int rssi = info.getRssi();
+        int rssi = currentWifiRssi();
         if (rssi <= -127) return 0;
-        return clamp(WifiManager.calculateSignalLevel(rssi, LEVEL_COUNT));
+        return clamp(calculateWifiLevel(rssi));
+    }
+
+    /** Freshest RSSI available; RSSI is never location-redacted. */
+    private int currentWifiRssi() {
+        if (wifiManager != null) {
+            try {
+                WifiInfo live = wifiManager.getConnectionInfo();
+                if (live != null && live.getRssi() > -127) return live.getRssi();
+            } catch (RuntimeException e) {
+                Log.d(TAG, "Live WifiInfo unavailable for RSSI", e);
+            }
+        }
+        WifiInfo info = getCurrentWifiInfo();
+        return info == null ? -127 : info.getRssi();
+    }
+
+    /**
+     * Uses the same device-specific RSSI thresholds as the status bar. The static
+     * calculateSignalLevel(rssi, 5) uses a fixed -100..-55 dBm scale, which can be one level
+     * lower than the system's value.
+     */
+    @SuppressWarnings("deprecation")
+    private int calculateWifiLevel(int rssi) {
+        if (wifiManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                int level = wifiManager.calculateSignalLevel(rssi);
+                int max = wifiManager.getMaxSignalLevel();
+                if (max > 0 && max != LEVEL_COUNT - 1) {
+                    level = Math.round(level * (LEVEL_COUNT - 1f) / max);
+                }
+                return level;
+            } catch (RuntimeException e) {
+                Log.d(TAG, "System Wi-Fi level API unavailable", e);
+            }
+        }
+        return WifiManager.calculateSignalLevel(rssi, LEVEL_COUNT);
     }
 
     private WifiInfo getCurrentWifiInfo() {
