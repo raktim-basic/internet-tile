@@ -452,16 +452,18 @@ public class InternetTileService extends TileService {
         boolean mobileDataEnabled = isMobileDataEnabled();
         Transport transport = getActiveTransport();
         boolean noInternet = isActiveTransportUnvalidated(transport);
+        // Wi-Fi can stay connected in airplane mode; then show it like any Wi-Fi connection.
+        boolean showAirplane = airplaneMode && transport != Transport.WIFI;
 
         tile.setLabel(getString(R.string.tile_label));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            tile.setSubtitle(airplaneMode
+            tile.setSubtitle(showAirplane
                     ? getString(R.string.connection_airplane_mode)
                     : getSubtitle(transport));
         }
         tile.setIcon(getLocalSignalIcon(transport, wifiEnabled, mobileDataEnabled,
-                airplaneMode, noInternet));
-        tile.setState(!airplaneMode && (wifiEnabled || mobileDataEnabled)
+                showAirplane, noInternet));
+        tile.setState(!showAirplane && (wifiEnabled || mobileDataEnabled)
                 ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
         tile.updateTile();
     }
