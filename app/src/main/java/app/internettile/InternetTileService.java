@@ -60,7 +60,6 @@ public class InternetTileService extends TileService {
     private volatile String lastKnownSsid;
     private volatile long lastSsidNetworkHandle = -1L;
     private volatile Integer lastCellularLevel;
-    private volatile TelephonyDisplayInfo lastDisplayInfo;
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -292,7 +291,6 @@ public class InternetTileService extends TileService {
         telephonyCallback = null;
         activeTelephonyManager = null;
         lastCellularLevel = null;
-        lastDisplayInfo = null;
     }
 
     private void unregisterListeners() {
@@ -736,51 +734,6 @@ public class InternetTileService extends TileService {
         return operator;
     }
 
-    private String getNetworkGeneration(TelephonyManager manager) {
-        int networkType = TelephonyManager.NETWORK_TYPE_UNKNOWN;
-        TelephonyDisplayInfo displayInfo = lastDisplayInfo;
-        if (displayInfo != null) {
-            int override = displayInfo.getOverrideNetworkType();
-            if (override == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA
-                    || override == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_ADVANCED) {
-                return "5G";
-            }
-            networkType = displayInfo.getNetworkType();
-        }
-        try {
-            int dataType = manager.getDataNetworkType();
-            if (dataType != TelephonyManager.NETWORK_TYPE_UNKNOWN) networkType = dataType;
-        } catch (RuntimeException e) {
-            Log.d(TAG, "Data network type unavailable", e);
-        }
-
-        switch (networkType) {
-            case TelephonyManager.NETWORK_TYPE_NR:
-                return "5G";
-            case TelephonyManager.NETWORK_TYPE_LTE:
-                return "LTE";
-            case TelephonyManager.NETWORK_TYPE_GSM:
-            case TelephonyManager.NETWORK_TYPE_GPRS:
-            case TelephonyManager.NETWORK_TYPE_EDGE:
-            case TelephonyManager.NETWORK_TYPE_CDMA:
-            case TelephonyManager.NETWORK_TYPE_1xRTT:
-                return "2G";
-            case TelephonyManager.NETWORK_TYPE_UMTS:
-            case TelephonyManager.NETWORK_TYPE_EVDO_0:
-            case TelephonyManager.NETWORK_TYPE_EVDO_A:
-            case TelephonyManager.NETWORK_TYPE_EVDO_B:
-            case TelephonyManager.NETWORK_TYPE_HSDPA:
-            case TelephonyManager.NETWORK_TYPE_HSUPA:
-            case TelephonyManager.NETWORK_TYPE_HSPA:
-            case TelephonyManager.NETWORK_TYPE_EHRPD:
-            case TelephonyManager.NETWORK_TYPE_HSPAP:
-            case TelephonyManager.NETWORK_TYPE_TD_SCDMA:
-                return "3G";
-            default:
-                return "";
-        }
-    }
-
     private boolean hasFineLocationPermission() {
         return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
                 == PackageManager.PERMISSION_GRANTED;
@@ -799,8 +752,9 @@ public class InternetTileService extends TileService {
             service.updateTile();
         }
 
+        // Kept as a refresh trigger: the carrier-provided network name shown in the subtitle
+        // can change with the display network type (e.g. LTE vs 5G).
         @Override public void onDisplayInfoChanged(TelephonyDisplayInfo displayInfo) {
-            service.lastDisplayInfo = displayInfo;
             service.updateTile();
         }
 
